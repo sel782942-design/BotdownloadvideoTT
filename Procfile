@@ -1,0 +1,1 @@
+worker: python tiktok_downloader_bot.py
