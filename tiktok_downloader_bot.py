@@ -19,28 +19,38 @@ DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 TIKTOK_URL_PATTERN = re.compile(r"(https?://(?:www\.|vt\.|vm\.)?tiktok\.com/\S+)")
+INSTAGRAM_URL_PATTERN = re.compile(
+    r"(https?://(?:www\.)?instagram\.com/(?:reel|reels|p|tv)/\S+)"
+)
 
-# Temporary in-memory map of message id -> tiktok url, so buttons know what to download
+# Temporary in-memory map of message id -> (platform, url), so buttons know what to download
 pending_urls = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send me a TikTok link. I'll ask if you want the video or just the audio."
+        "Send me a TikTok or Instagram link. I'll ask if you want the video or just the audio."
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
-    match = TIKTOK_URL_PATTERN.search(text)
 
-    if not match:
-        await update.message.reply_text("Please send a valid TikTok link.")
+    tiktok_match = TIKTOK_URL_PATTERN.search(text)
+    instagram_match = INSTAGRAM_URL_PATTERN.search(text)
+
+    if tiktok_match:
+        platform = "tiktok"
+        url = tiktok_match.group(1)
+    elif instagram_match:
+        platform = "instagram"
+        url = instagram_match.group(1)
+    else:
+        await update.message.reply_text("Please send a valid TikTok or Instagram link.")
         return
 
-    url = match.group(1)
     msg = await update.message.reply_text("What would you like?")
-    pending_urls[msg.message_id] = url
+    pending_urls[msg.message_id] = (platform, url)
 
     keyboard = [
         [
@@ -57,22 +67,24 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mode, msg_id_str = query.data.split(":")
     msg_id = int(msg_id_str)
-    url = pending_urls.get(msg_id)
+    entry = pending_urls.get(msg_id)
 
-    if not url:
+    if not entry:
         await query.edit_message_text("This link expired, please send it again.")
         return
+
+    platform, url = entry
 
     await query.edit_message_text("Downloading, please wait...")
 
     file_path = None
     try:
         if mode == "video":
-            file_path = download_tiktok(url, audio_only=False)
+            file_path = download_media(url, platform, audio_only=False)
             with open(file_path, "rb") as f:
                 await query.message.reply_video(video=f, supports_streaming=True)
         else:
-            file_path = download_tiktok(url, audio_only=True)
+            file_path = download_media(url, platform, audio_only=True)
             with open(file_path, "rb") as f:
                 await query.message.reply_audio(audio=f)
         await query.message.delete()
@@ -85,8 +97,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_urls.pop(msg_id, None)
 
 
-def download_tiktok(url: str, audio_only: bool = False) -> str:
-    """Downloads a TikTok video or its audio track and returns the local file path."""
+def download_media(url: str, platform: str, audio_only: bool = False) -> str:
+    """Downloads a TikTok or Instagram video (or its audio track) and returns the local file path."""
     output_template = os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s")
 
     if audio_only:
@@ -104,11 +116,17 @@ def download_tiktok(url: str, audio_only: bool = False) -> str:
     else:
         ydl_opts = {
             "outtmpl": output_template,
-            "format": "mp4",
+            "format": "mp4/bestvideo+bestaudio/best",
             "quiet": True,
             "no_warnings": True,
-            "extractor_args": {"tiktok": {"download_without_watermark": ["true"]}},
         }
+        if platform == "tiktok":
+            ydl_opts["extractor_args"] = {"tiktok": {"download_without_watermark": ["true"]}}
+
+    # Instagram private/login-walled content needs cookies; see note below.
+    cookie_file = os.environ.get("INSTAGRAM_COOKIES_FILE")
+    if platform == "instagram" and cookie_file and os.path.exists(cookie_file):
+        ydl_opts["cookiefile"] = cookie_file
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
